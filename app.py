@@ -1,29 +1,31 @@
+import re
 import json
+from datetime import datetime
 import streamlit as st
 from openai import OpenAI
 from openai import RateLimitError, APIError
+from docx import Document
 
-st.set_page_config(page_title="AI Listing Assistant v2.0", page_icon="🏡", layout="centered")
+st.set_page_config(page_title="Listing Marketing Assistant", page_icon="🏡", layout="wide")
 
 # -----------------------
-# Auth (simple password gate)
+# Simple password gate (optional)
 # -----------------------
-def require_password() -> bool:
+def require_password() -> None:
     expected = st.secrets.get("APP_PASSWORD", "")
     if not expected:
-        # If no password set, don't gate
-        return True
+        return
 
     if "authed" not in st.session_state:
         st.session_state.authed = False
 
     if st.session_state.authed:
-        return True
+        return
 
-    st.title("🏡 AI Listing Assistant")
+    st.title("🏡 Listing Marketing Assistant")
     st.caption("Enter the demo password to continue.")
-
     pwd = st.text_input("Password", type="password")
+
     if st.button("Unlock"):
         if pwd == expected:
             st.session_state.authed = True
@@ -32,13 +34,12 @@ def require_password() -> bool:
             st.error("Incorrect password.")
     st.stop()
 
-
 require_password()
 
 # -----------------------
 # Client setup
 # -----------------------
-api_key = st.secrets.get("OPENAI_API_KEY", "")
+api_key = st.secrets.get("OPENAI_API_KEY")
 if not api_key:
     st.error("Missing OPENAI_API_KEY in Streamlit Secrets.")
     st.stop()
@@ -49,262 +50,418 @@ client = OpenAI(api_key=api_key)
 # Session state
 # -----------------------
 if "history" not in st.session_state:
-    st.session_state.history = []  # list of dicts {meta, outputs}
+    st.session_state.history = []
 if "brand_voice" not in st.session_state:
-    st.session_state.brand_voice = "Friendly, clear, professional. Avoid hype. Focus on benefits and key features."
+    st.session_state.brand_voice = (
+        "Friendly, clear, professional. Avoid hype and ALL CAPS. "
+        "Focus on benefits, key features, and accuracy."
+    )
 if "busy" not in st.session_state:
     st.session_state.busy = False
 
-# -----------------------
-# UI
-# -----------------------
-st.title("🏡 AI Listing Assistant v2.0")
-st.caption("Generate MLS copy + social pack + buyer email. Includes saved history and a brokerage voice profile.")
-
-with st.expander("🏢 Brokerage Voice / Style Profile (saved)"):
-    st.session_state.brand_voice = st.text_area(
-        "Describe your brokerage voice (tone, length, do/don'ts).",
-        value=st.session_state.brand_voice,
-        height=120,
-        placeholder="Example: Warm, confident, not salesy. Avoid ALL CAPS. Keep MLS factual..."
-    )
-
-colA, colB = st.columns(2)
-with colA:
-    tone = st.selectbox(
-        "Tone preset",
-        ["Professional MLS", "Warm + inviting", "Modern + punchy", "Luxury", "Investor-focused"],
-        index=0
-    )
-with colB:
-    include_cta = st.checkbox("Include a clear CTA", value=True)
-
-with st.form("listing_form"):
-    address = st.text_input("Address", placeholder="123 Maple St, Toledo, OH")
-    price = st.text_input("Price", placeholder="$325,000")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        beds = st.number_input("Bedrooms", min_value=0, max_value=20, value=3)
-    with c2:
-        baths = st.number_input("Bathrooms", min_value=0.0, max_value=20.0, value=2.0, step=0.5)
-    with c3:
-        sqft = st.number_input("Square feet", min_value=0, max_value=20000, value=1850, step=50)
-
-    highlights = st.text_area(
-        "Highlights / Features",
-        placeholder="Renovated kitchen, fenced yard, finished basement, new HVAC, hardwood floors...",
-        height=110
-    )
-    neighborhood = st.text_area(
-        "Neighborhood / Location Notes",
-        placeholder="Walkable to parks, close to downtown, top-rated schools, near highways...",
-        height=90
-    )
-
-    submitted = st.form_submit_button("Generate Marketing Copy", disabled=st.session_state.busy)
 
 # -----------------------
-# Generation
+# Helpers
 # -----------------------
-def build_prompt() -> str:
-    cta = "Include a clear call-to-action (schedule a showing, message for details)." if include_cta else "No call-to-action."
-    return f"""
-You are a real estate marketing expert and MLS-compliant copywriter.
-
-Follow this brokerage voice profile:
-{st.session_state.brand_voice}
-
-Rules:
-- Avoid discriminatory language or references to protected classes.
-- Keep MLS description factual, not exaggerated.
-- Do not mention demographics.
-- Do not invent details not provided.
-
-Task:
-Generate marketing copy for the property below.
-
-Property details:
-Address: {address}
-Price: {price}
-Beds: {beds}
-Baths: {baths}
-Square Feet: {sqft}
-Highlights: {highlights}
-Neighborhood notes: {neighborhood}
-
-Tone preset: {tone}
-CTA rule: {cta}
-
-Return STRICT JSON with this schema:
-{{
-  "mls": {{
-    "headline": "string (max 12 words)",
-    "description": "string (120-180 words)"
-  }},
-  "social": {{
-    "instagram": "string",
-    "facebook": "string",
-    "hashtags": ["string", "string", "string", "string", "string"]
-  }},
-  "email": {{
-    "subject": "string",
-    "body": "string (5-8 sentences)"
-  }}
-}}
-"""
+def clean_text(s: str) -> str:
+    return re.sub(r"\n{3,}", "\n\n", (s or "").strip())
 
 def safe_parse_json(text: str) -> dict:
-    # Try direct JSON parse
     try:
         return json.loads(text)
     except Exception:
-        # Try to extract JSON block if model included extra text
-        start = text.find("{")
-        end = text.rfind("}")
+        start, end = text.find("{"), text.rfind("}")
         if start != -1 and end != -1 and end > start:
             try:
                 return json.loads(text[start:end+1])
             except Exception:
                 pass
-        return {}
+    return {}
 
-def generate_outputs() -> dict:
-    prompt = build_prompt()
+def make_docx(title: str, meta: dict, outputs: dict) -> bytes:
+    doc = Document()
+    doc.add_heading(title, level=1)
+
+    if meta:
+        doc.add_paragraph(f"Address: {meta.get('address','')}")
+        if meta.get("price"):
+            doc.add_paragraph(f"Price: {meta.get('price')}")
+        stats = f"{meta.get('beds','')} bd • {meta.get('baths','')} ba • {meta.get('sqft','')} sqft"
+        doc.add_paragraph(stats)
+        if meta.get("listing_url"):
+            doc.add_paragraph(f"Listing URL: {meta.get('listing_url')}")
+        doc.add_paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+
+    doc.add_paragraph("")
+
+    mls = outputs.get("mls", {})
+    social = outputs.get("social", {})
+    email = outputs.get("email", {})
+
+    doc.add_heading("MLS Listing", level=2)
+    doc.add_paragraph(mls.get("headline", ""))
+    doc.add_paragraph(mls.get("description", ""))
+
+    doc.add_heading("Social Media", level=2)
+    doc.add_heading("Instagram", level=3)
+    doc.add_paragraph(social.get("instagram", ""))
+    doc.add_heading("Facebook", level=3)
+    doc.add_paragraph(social.get("facebook", ""))
+    tags = social.get("hashtags", [])
+    if tags:
+        doc.add_paragraph("Hashtags: " + " ".join([t if t.startswith("#") else f"#{t}" for t in tags]))
+
+    doc.add_heading("Buyer Email", level=2)
+    doc.add_paragraph("Subject: " + email.get("subject", ""))
+    doc.add_paragraph(email.get("body", ""))
+
+    import io
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+def build_generation_prompt(meta: dict) -> str:
+    voice = st.session_state.brand_voice
+    tone = meta.get("tone_preset", "Professional MLS")
+    include_cta = meta.get("include_cta", True)
+    cta_rule = "Include a clear call-to-action." if include_cta else "No call-to-action."
+
+    return f"""
+You are a real estate marketing expert and MLS-compliant copywriter.
+
+Brokerage voice profile:
+{voice}
+
+Rules:
+- Avoid discriminatory language or references to protected classes.
+- Keep MLS description factual, not exaggerated.
+- Do not invent details not provided.
+- If something is missing (e.g., price), omit it gracefully.
+
+Task:
+Create:
+1) MLS headline (max 12 words) + MLS description (120–180 words)
+2) Social pack: Instagram + Facebook + 5 hashtags
+3) Buyer email: subject + 5–8 sentences
+
+Tone preset: {tone}
+CTA rule: {cta_rule}
+
+Property details:
+Address: {meta.get("address","")}
+Price: {meta.get("price","")}
+Beds: {meta.get("beds","")}
+Baths: {meta.get("baths","")}
+Square Feet: {meta.get("sqft","")}
+Highlights: {meta.get("highlights","")}
+Neighborhood notes: {meta.get("neighborhood","")}
+
+Return STRICT JSON with schema:
+{{
+  "mls": {{
+    "headline": "string",
+    "description": "string"
+  }},
+  "social": {{
+    "instagram": "string",
+    "facebook": "string",
+    "hashtags": ["string","string","string","string","string"]
+  }},
+  "email": {{
+    "subject": "string",
+    "body": "string"
+  }}
+}}
+"""
+
+def build_extract_prompt(listing_text: str) -> str:
+    return f"""
+Extract real-estate listing details from the text below.
+
+Return STRICT JSON with schema:
+{{
+  "address": "string or empty",
+  "price": "string or empty",
+  "beds": "number or empty",
+  "baths": "number or empty",
+  "sqft": "number or empty",
+  "highlights": "string (comma-separated features)",
+  "neighborhood": "string"
+}}
+
+Text:
+{listing_text}
+"""
+
+def call_model(prompt: str, max_tokens: int = 800, temperature: float = 0.7) -> str:
     resp = client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=[
-            {"role": "system", "content": "You write compliant real estate marketing copy and return valid JSON only."},
+            {"role": "system", "content": "Return exactly what the user asked for. If JSON requested, output valid JSON only."},
             {"role": "user", "content": prompt},
         ],
-        temperature=0.7,
-        max_tokens=800,
+        temperature=temperature,
+        max_tokens=max_tokens,
     )
-    text = resp.choices[0].message.content
-    data = safe_parse_json(text)
-    if not data:
-        # Fallback: show raw text in a minimal wrapper
-        data = {
-            "mls": {"headline": "Generated Listing", "description": text},
-            "social": {"instagram": "", "facebook": "", "hashtags": []},
-            "email": {"subject": "", "body": ""},
-            "_raw": text,
-        }
-    return data
+    return resp.choices[0].message.content
 
-if submitted:
-    if not address or not highlights:
-        st.error("Please provide at least an address and some highlights/features.")
-    else:
-        st.session_state.busy = True
-        try:
-            with st.spinner("Generating..."):
-                outputs = generate_outputs()
-
-            # Save to history
-            st.session_state.history.insert(0, {
-                "meta": {
-                    "address": address,
-                    "price": price,
-                    "beds": beds,
-                    "baths": baths,
-                    "sqft": sqft,
-                    "tone": tone
-                },
-                "outputs": outputs
-            })
-
-            st.success("Generated and saved to history.")
-        except RateLimitError:
-            st.error("OpenAI rate limit / quota hit. Try again in a moment or check your API billing/limits.")
-        except APIError as e:
-            st.error(f"OpenAI API error: {e}")
-        except Exception as e:
-            st.error(f"Unexpected error: {e}")
-        finally:
-            st.session_state.busy = False
 
 # -----------------------
-# History + Results
+# UI (friendly)
 # -----------------------
-st.divider()
+st.title("🏡 Listing Marketing Assistant")
+st.caption("Paste a listing link (optional) + details. Generate MLS copy, social posts, and a buyer email.")
 
-left, right = st.columns([0.9, 1.1])
+left, right = st.columns([0.95, 1.05], gap="large")
 
 with left:
-    st.subheader("🕘 History")
-    if not st.session_state.history:
-        st.caption("No generations yet. Create one above.")
-    else:
-        options = []
-        for i, item in enumerate(st.session_state.history):
-            m = item["meta"]
-            label = f'{m.get("address","(no address)")} — {m.get("price","")} ({m.get("tone","")})'
-            options.append((label, i))
+    st.subheader("1) Add listing info")
 
-        selected_label = st.selectbox(
-            "Select a previous result",
-            options=[o[0] for o in options],
+    with st.expander("🏢 Brokerage voice (saved)", expanded=False):
+        st.session_state.brand_voice = st.text_area(
+            "How should it sound?",
+            value=st.session_state.brand_voice,
+            height=110
+        )
+
+    listing_url = st.text_input("Listing URL (Zillow/Redfin/any)", placeholder="https://www.zillow.com/homedetails/...")
+    st.caption("Tip: For Zillow, paste the link for reference, then copy/paste the listing text below for best results.")
+
+    pasted_listing_text = st.text_area(
+        "Paste listing text (Facts & Features / Description)",
+        placeholder="Copy from Zillow/MLS: beds, baths, sqft, upgrades, neighborhood notes…",
+        height=160
+    )
+
+    colx, coly = st.columns(2)
+    with colx:
+        tone_preset = st.selectbox(
+            "Tone",
+            ["Professional MLS", "Warm + inviting", "Modern + punchy", "Luxury", "Investor-focused"],
             index=0
         )
-        selected_idx = next(i for (lbl, i) in options if lbl == selected_label)
+    with coly:
+        include_cta = st.checkbox("Include a call-to-action", value=True)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("Delete selected"):
-                st.session_state.history.pop(selected_idx)
-                st.rerun()
-        with col2:
-            if st.button("Clear all history"):
-                st.session_state.history = []
-                st.rerun()
+    st.markdown("---")
+    st.subheader("2) Or type manually (optional)")
+
+    with st.form("manual_form"):
+        address = st.text_input("Address", placeholder="123 Maple St, Toledo, OH")
+        price = st.text_input("Price", placeholder="$325,000")
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            beds = st.number_input("Bedrooms", min_value=0, max_value=20, value=3)
+        with c2:
+            baths = st.number_input("Bathrooms", min_value=0.0, max_value=20.0, value=2.0, step=0.5)
+        with c3:
+            sqft = st.number_input("Square feet", min_value=0, max_value=20000, value=1850, step=50)
+
+        highlights = st.text_area("Highlights / Features", height=90)
+        neighborhood = st.text_area("Neighborhood / Location notes", height=70)
+
+        submitted_manual = st.form_submit_button("Generate marketing pack", disabled=st.session_state.busy)
+
+    col_extract, col_generate = st.columns(2)
+    with col_extract:
+        extract_clicked = st.button("✨ Fill fields from pasted text", disabled=st.session_state.busy)
+    with col_generate:
+        generate_from_paste_clicked = st.button("Generate from pasted text", disabled=st.session_state.busy)
+
+    # Store the latest "working meta" dict here
+    if "working_meta" not in st.session_state:
+        st.session_state.working_meta = {}
+
+    # Extraction step
+    if extract_clicked:
+        if not pasted_listing_text.strip():
+            st.warning("Paste listing text first.")
+        else:
+            st.session_state.busy = True
+            try:
+                with st.spinner("Extracting details..."):
+                    raw = call_model(build_extract_prompt(pasted_listing_text), max_tokens=350, temperature=0.2)
+                    data = safe_parse_json(raw) or {}
+                # Merge into manual fields (best-effort)
+                st.session_state.working_meta = {
+                    "address": data.get("address", ""),
+                    "price": data.get("price", ""),
+                    "beds": data.get("beds", ""),
+                    "baths": data.get("baths", ""),
+                    "sqft": data.get("sqft", ""),
+                    "highlights": data.get("highlights", ""),
+                    "neighborhood": data.get("neighborhood", ""),
+                    "listing_url": listing_url,
+                    "tone_preset": tone_preset,
+                    "include_cta": include_cta,
+                }
+                st.success("Extracted! Scroll down on the right to generate, or re-run with tweaks.")
+            except RateLimitError:
+                st.error("Rate limit / quota hit. Try again in a moment.")
+            except APIError as e:
+                st.error(f"OpenAI API error: {e}")
+            except Exception as e:
+                st.error(f"Unexpected error: {e}")
+            finally:
+                st.session_state.busy = False
+
+    # Generate directly from pasted text
+    if generate_from_paste_clicked:
+        if not pasted_listing_text.strip():
+            st.warning("Paste listing text first.")
+        else:
+            st.session_state.busy = True
+            try:
+                with st.spinner("Generating marketing pack..."):
+                    # Extract first (quick) then generate
+                    raw = call_model(build_extract_prompt(pasted_listing_text), max_tokens=350, temperature=0.2)
+                    data = safe_parse_json(raw) or {}
+                    meta = {
+                        "address": data.get("address", ""),
+                        "price": data.get("price", ""),
+                        "beds": data.get("beds", ""),
+                        "baths": data.get("baths", ""),
+                        "sqft": data.get("sqft", ""),
+                        "highlights": data.get("highlights", ""),
+                        "neighborhood": data.get("neighborhood", ""),
+                        "listing_url": listing_url,
+                        "tone_preset": tone_preset,
+                        "include_cta": include_cta,
+                    }
+                    out_raw = call_model(build_generation_prompt(meta), max_tokens=900, temperature=0.7)
+                    outputs = safe_parse_json(out_raw) or {"_raw": out_raw}
+
+                st.session_state.history.insert(0, {"meta": meta, "outputs": outputs})
+                st.success("Done! See results on the right →")
+            except RateLimitError:
+                st.error("Rate limit / quota hit. Try again in a moment.")
+            except APIError as e:
+                st.error(f"OpenAI API error: {e}")
+            except Exception as e:
+                st.error(f"Unexpected error: {e}")
+            finally:
+                st.session_state.busy = False
+
+    # Generate from manual form
+    if submitted_manual:
+        meta = {
+            "address": address,
+            "price": price,
+            "beds": beds,
+            "baths": baths,
+            "sqft": sqft,
+            "highlights": highlights,
+            "neighborhood": neighborhood,
+            "listing_url": listing_url,
+            "tone_preset": tone_preset,
+            "include_cta": include_cta,
+        }
+        if not meta["address"] and not meta["highlights"]:
+            st.warning("Add an address or highlights so the copy has something to work with.")
+        else:
+            st.session_state.busy = True
+            try:
+                with st.spinner("Generating marketing pack..."):
+                    out_raw = call_model(build_generation_prompt(meta), max_tokens=900, temperature=0.7)
+                    outputs = safe_parse_json(out_raw) or {"_raw": out_raw}
+                st.session_state.history.insert(0, {"meta": meta, "outputs": outputs})
+                st.success("Done! See results on the right →")
+            except RateLimitError:
+                st.error("Rate limit / quota hit. Try again in a moment.")
+            except APIError as e:
+                st.error(f"OpenAI API error: {e}")
+            except Exception as e:
+                st.error(f"Unexpected error: {e}")
+            finally:
+                st.session_state.busy = False
+
 
 with right:
-    st.subheader("📄 Output")
-    if not st.session_state.history:
-        st.caption("Generate copy to see results here.")
-    else:
-        item = st.session_state.history[0]  # show most recent by default
-        # If user selected a different item, use that
-        if "selected_idx" in locals():
-            item = st.session_state.history[selected_idx]
+    st.subheader("Marketing Pack")
 
+    if not st.session_state.history:
+        st.info("Generate a marketing pack and it will show up here.")
+    else:
+        # Picker
+        labels = []
+        for i, item in enumerate(st.session_state.history):
+            m = item["meta"]
+            addr = m.get("address") or "(no address)"
+            labels.append(f"{i+1}. {addr} — {m.get('price','')}")
+
+        selected = st.selectbox("Saved packs", labels, index=0)
+        idx = int(selected.split(".")[0]) - 1
+        item = st.session_state.history[idx]
+
+        meta = item["meta"]
         outputs = item["outputs"]
+
+        st.markdown(
+            f"**{meta.get('address','')}**  \n"
+            f"{meta.get('beds','')} bd • {meta.get('baths','')} ba • {meta.get('sqft','')} sqft"
+            + (f" • **{meta.get('price','')}**" if meta.get("price") else "")
+        )
+        if meta.get("listing_url"):
+            st.caption(f"Link: {meta.get('listing_url')}")
+
         mls = outputs.get("mls", {})
         social = outputs.get("social", {})
         email = outputs.get("email", {})
 
-        tab_mls, tab_social, tab_email = st.tabs(["MLS", "Social", "Email"])
+        tab1, tab2, tab3 = st.tabs(["MLS Listing", "Social Posts", "Buyer Email"])
 
-        with tab_mls:
-            st.markdown("**Headline**")
-            st.code(mls.get("headline", ""), language="text")
-            st.markdown("**Description**")
-            st.code(mls.get("description", ""), language="text")
+        with tab1:
+            st.text_input("MLS Headline", value=clean_text(mls.get("headline","")), key=f"headline_{idx}")
+            st.text_area(
+                "MLS Description",
+                value=clean_text(mls.get("description","") or outputs.get("_raw","")),
+                height=220,
+                key=f"mlsdesc_{idx}"
+            )
 
-        with tab_social:
-            st.markdown("**Instagram**")
-            st.code(social.get("instagram", ""), language="text")
-            st.markdown("**Facebook**")
-            st.code(social.get("facebook", ""), language="text")
+        with tab2:
+            st.text_area("Instagram", value=clean_text(social.get("instagram","")), height=140, key=f"ig_{idx}")
+            st.text_area("Facebook", value=clean_text(social.get("facebook","")), height=140, key=f"fb_{idx}")
             tags = social.get("hashtags", [])
             if tags:
-                st.markdown("**Hashtags**")
-                st.code(" ".join([t if t.startswith("#") else f"#{t.replace(' ','')}" for t in tags]), language="text")
+                tag_line = " ".join([t if t.startswith("#") else f"#{t.replace(' ','')}" for t in tags])
+                st.text_input("Hashtags", value=tag_line, key=f"tags_{idx}")
 
-        with tab_email:
-            st.markdown("**Subject**")
-            st.code(email.get("subject", ""), language="text")
-            st.markdown("**Body**")
-            st.code(email.get("body", ""), language="text")
+        with tab3:
+            st.text_input("Email Subject", value=clean_text(email.get("subject","")), key=f"subj_{idx}")
+            st.text_area("Email Body", value=clean_text(email.get("body","")), height=220, key=f"body_{idx}")
 
-        # Export
-        export_payload = {
-            "meta": item["meta"],
-            "outputs": outputs
-        }
-        st.download_button(
-            "Download JSON",
-            data=json.dumps(export_payload, indent=2).encode("utf-8"),
-            file_name="listing_output.json",
-            mime="application/json"
-        )
+        # Friendly downloads
+        combined_txt = "\n\n".join([
+            "MLS HEADLINE:\n" + clean_text(mls.get("headline","")),
+            "MLS DESCRIPTION:\n" + clean_text(mls.get("description","") or outputs.get("_raw","")),
+            "INSTAGRAM:\n" + clean_text(social.get("instagram","")),
+            "FACEBOOK:\n" + clean_text(social.get("facebook","")),
+            "HASHTAGS:\n" + (" ".join(social.get("hashtags", [])) if social.get("hashtags") else ""),
+            "EMAIL SUBJECT:\n" + clean_text(email.get("subject","")),
+            "EMAIL BODY:\n" + clean_text(email.get("body","")),
+        ]).strip()
+
+        col_d1, col_d2, col_d3 = st.columns([1, 1, 1])
+        with col_d1:
+            st.download_button(
+                "Download Marketing Pack (.txt)",
+                data=combined_txt.encode("utf-8"),
+                file_name="marketing-pack.txt",
+                mime="text/plain"
+            )
+        with col_d2:
+            docx_bytes = make_docx("Marketing Pack", meta, outputs)
+            st.download_button(
+                "Download as Word (.docx)",
+                data=docx_bytes,
+                file_name="marketing-pack.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+        with col_d3:
+            if st.button("Delete this pack"):
+                st.session_state.history.pop(idx)
+                st.rerun()
+
+st.caption("Note: Zillow links are accepted for reference; for best results paste the listing text into the app.")
